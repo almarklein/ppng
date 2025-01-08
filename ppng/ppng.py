@@ -1,103 +1,161 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2016, Almar Klein
-# This module is distributed under the terms of the new BSD License.
+# Copyright (c) 2016-2025, Almar Klein
+# This module is distributed under the terms of the MIT License.
+#
+# This module is small enough so that it can be included in a larger project.
+# Or you can make ppng a (light) dependency.
 
 """
-Pure python module to handle for reading and writing png files. Written
-for Python 2.7 and Python 3.2+. Can only read PNG's that are not
-interlaced, have a bit depth of 8, and are either RGB or RGBA.
+Pure python module to handle for reading and writing png files.
+
+Supports:
+- Greyscale, greyscale-plus-alpha, RGB, RGBA.
+- 8 bit and 16 bit.
+- Chunked writing.
+- Animated images.
+- Volumetric images.
+
+Does not support:
+- interlacing.
+- paletted images.
+
 """
 
-from __future__ import print_function, division, absolute_import
-
-import io
-import struct
 import zlib
+import struct
+import pathlib
+
+from typing import Union
+
+__all__ = ["PngWriter", "write_png"]
+
+__version__ = "1.0.0"
+version_info = tuple(int(i) if i.isnumeric() else i for i in __version__.split("."))
 
 
-def write_png(im, shape=None, file=None):
-    """
-    Write a png image. The written image is in RGB or RGBA format, with
-    8 bit precision, and without interlacing.
+# ----- utils
 
-    Parameters:
-        im (bytes, bytearray, numpy-array): the image data to write.
-        shape (tuple): the shape of the image. If ``im`` is a numpy array,
-            the shape can be omitted. The shape can be ``(H, W)`` for
-            grayscale, ``(H, W, 3)`` for RGB and ``(H, W, 4)`` for RGBA.
-            Note that grayscale images are converted to RGB.
-        file (file-like object, None): where to write the resulting
-            image. If omitted or None, the result is returned as bytes.
-    """
 
-    # Check types
-    if hasattr(im, "shape") and hasattr(im, "dtype"):
-        if shape and tuple(shape) != im.shape:
-            raise ValueError("write_png got mismatch in im.shape and shape")
-        if im.dtype != "uint8":
-            raise TypeError("Image data to write to PNG must be uint8")
-        shape = im.shape
-        im = im.tobytes()
-    elif isinstance(im, (bytes, bytearray)):
-        if not isinstance(shape, (tuple, list)):
-            raise ValueError("write_png needs a shape unless ndarray is given")
-        shape = tuple(shape)
+COLOR_TYPES = {
+    # "p": (0b011, 1, (1, 2, 4, 8)),
+    "l": (0b000, 1, (1, 2, 4, 8, 16)),
+    "la": (0b100, 2, (8, 16)),
+    "rgb": (0b010, 3, (8, 16)),
+    "rgba": (0b110, 4, (8, 16)),
+}
+N_CHANNELS_TO_FORMAT = ["zero", "l", "la", "rgb", "rgba"]
+
+
+# ----- writing
+
+
+def write_png(file, image):
+    mem = memoryview(image)
+    width, height = mem.shape[1], mem.shape[0]
+    if len(mem.shape) == 2:
+        format = "l"
+    elif len(mem.shape) == 3:
+        format = N_CHANNELS_TO_FORMAT[mem.shape[2]]
     else:
-        raise ValueError(
-            "Invalid type for im, "
-            "need ndarray, bytearray or bytes, got %r" % type(im)
-        )
+        raise ValueError("Unexpected data shape {mem.shape}")
+    with PngWriter(file, width, height, format) as writer:
+        writer.write(mem)
 
-    # Allow grayscale: convert to RGB
-    if len(shape) == 2 or (len(shape) == 3 and shape[2] == 1):
-        im3 = bytearray(shape[0] * shape[1] * 3)
-        im3[0::3] = im
-        im3[1::3] = im
-        im3[2::3] = im
-        im = im3
-        shape = shape[0], shape[1], 3
 
-    # Check shape
-    if len(shape) != 3:
-        raise ValueError("shape must be 3 elements)")
-    if shape[2] not in (3, 4):
-        raise ValueError("shape[2] must be in (3, 4)")
-    if (shape[0] * shape[1] * shape[2]) != len(im):
-        raise ValueError("Shape does not match number of elements in image")
+class PngWriter:
+    """Object that supports streamed writing to a png file.
 
-    # Get file object
-    f = io.BytesIO() if file is None else file
+    Usage:
 
-    def add_chunk(data, name):
+        with PngWriter(file, width, height, format) as writer:
+            writer.write(part)
+            ...
+            writer.write(part)
+    """
+
+    def __init__(self, file, width, height, format, *, zlib_level=9):
+        # Get file handle
+        self.file = file
+        if isinstance(self.file, (str, pathlib.Path)):
+            self.fh = open(self.file, "wb")
+        elif hasattr(self.file, "write"):
+            self.fh = self.file
+        else:
+            raise RuntimeError(f"Cannot write to {self.file}")
+
+        self.width = int(width)
+        self.height = int(height)
+        self.format = str(format).lower()
+        if self.format not in COLOR_TYPES:
+            raise ValueError("Unknown/unsupported color format: '{format}'")
+
+        # Configuration
+        self.zlib_level = int(zlib_level)
+
+    def __enter__(self):
+        # Write signature and header chunk
+        self._write_signature()
+        self._write_chunk_ihdr()
+
+        return self
+
+    def __exit__(self, value, type, tb):
+        # todo: check that all is written
+        self._write_chunk("IEND", b"")
+        if self.fh is not self.file:
+            self.fh.close()
+        self.fh = None
+
+    def write(self, pixel_data):
+        if self.fh is None:
+            raise RuntimeError("Attempt to write to PngWriter after it has finished.")
+        mem = memoryview(pixel_data)
+        # todo: check
+        # todo: split in smaller chunks automartically
+        self._write_chunk_idat(mem)
+
+    def _write_signature(self):
+        self.fh.write(b"\x89PNG\x0d\x0a\x1a\x0a")  # signature
+
+    def _write_chunk(self, name: str, datas: Union[bytes, list]):
+        if isinstance(datas, bytes):
+            datas = [datas]
         name = name.encode("ASCII")
-        crc = zlib.crc32(data, zlib.crc32(name))
-        f.write(struct.pack(">I", len(data)))
-        f.write(name)
-        f.write(data)
-        # f.write(crc.to_bytes(4, 'big'))  # python 3.x +
-        f.write(struct.pack(">I", crc & 0xFFFFFFFF))
+        # Get checksum and byte count
+        checksum = zlib.crc32(name)
+        nbytes = 0
+        for bb in datas:
+            nbytes += len(bb)
+            checksum = zlib.crc32(bb, checksum)
+        # Write
+        self.fh.write(struct.pack(">I", nbytes))
+        self.fh.write(name)
+        for bb in datas:
+            self.fh.write(bb)
+        self.fh.write(checksum.to_bytes(4, "big"))
 
-    f.write(b"\x89PNG\x0d\x0a\x1a\x0a")  # header
+    def _write_chunk_ihdr(self):
+        depth = 8
+        ctyp = COLOR_TYPES[self.format][0]
+        data = struct.pack(">IIBBBBB", self.width, self.height, depth, ctyp, 0, 0, 0)
+        self._write_chunk("IHDR", data)
 
-    # First chunk
-    w, h = shape[1], shape[0]
-    depth = 8
-    ctyp = 0b0110 if shape[2] == 4 else 0b0010
-    ihdr = struct.pack(">IIBBBBB", w, h, depth, ctyp, 0, 0, 0)
-    add_chunk(ihdr, "IHDR")
+    def _write_chunk_idat(self, mem: memoryview):
+        datas = []
+        c = zlib.compressobj(self.zlib_level, 8, 15, 9)
+        for i in range(mem.shape[0]):
+            scanline = mem[i : i + 1]
+            filter_flag = b"\x00"  # no filter
+            bb = c.compress(filter_flag)
+            if bb:
+                datas.append(bb)
+            bb = c.compress(scanline)
+            if bb:
+                datas.append(bb)
+        datas.append(c.flush())
+        self._write_chunk("IDAT", datas)
 
-    # Chunk with pixels. Just one chunk, no fancy filters.
-    line_len = w * shape[2]
-    lines = [im[i * line_len : (i + 1) * line_len] for i in range(h)]
-    lines = [b"\x00" + bytes(line) for line in lines]  # prepend filter byt
-    pixels_compressed = zlib.compress(b"".join(lines), 9)
-    add_chunk(pixels_compressed, "IDAT")
 
-    # Closing chunk
-    add_chunk(b"", "IEND")
-
-    if file is None:
-        return f.getvalue()
+# ----- reading
 
 
 def read_png(f, return_ndarray=False):
