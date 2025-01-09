@@ -25,6 +25,7 @@ import zlib
 import struct
 import pathlib
 import logging
+import itertools
 from typing import Union
 
 __all__ = ["PngReader", "PngWriter", "read_png", "write_apng", "write_png"]
@@ -86,7 +87,7 @@ def write_png(file, image, *, compression=9):
     mem = memoryview(image)
     width, height, format = _get_im_props_from_memoryview(mem)
     with PngWriter(file, width, height, format, compression=compression) as writer:
-        writer.write(mem)
+        writer.write_static_frame(mem)
 
 
 def write_apng(file, images, compression=9):
@@ -135,6 +136,7 @@ class PngWriter:
         png_mode="png",
         frame_count=1,
         compression=9,
+        chunk_limmit=2**20,
     ):
         # Get file handle
         self.file = file
@@ -148,19 +150,20 @@ class PngWriter:
         self.width = int(width)
         self.height = int(height)
         self.format = str(format).lower()
-        if self.format not in COLOR_TYPES or self.format == "p":
-            raise ValueError("Unknown/unsupported color format: '{format}'")
+        if self.format not in FORMAT_TO_PSIZE or self.format == "p":
+            raise ValueError(f"Unknown/unsupported color format: '{format}'")
 
         # Configuration
         self._compression = int(compression)
         self._png_mode = str(png_mode)
         self._frame_count = int(frame_count)  # for apng
+        self._chunk_limit = int(chunk_limmit)
 
         # State
         self._animation_frames_written = 0
-        self._apng_sequence_number = 0  # explicitly order the apng chunks
-        self._idat_written = False
-        self._idat_compressor = None
+        self._apng_sequence_number = itertools.count()
+        self._idat_written = 0  # 0 no, 1 wip, 2 done
+        self._compressor = FrameCompressor(self._compression, self.height)
 
     def __enter__(self):
         # Write signature and header chunk
@@ -178,6 +181,8 @@ class PngWriter:
         self.fh = None
 
         # Sanity checks
+        if not self._compressor.done:
+            logger.warning("Not all IDAT data has been written.")
         if self._png_mode == "apng":
             if self._animation_frames_written != self._frame_count:
                 logger.warning(
@@ -185,17 +190,38 @@ class PngWriter:
                     + "but wrote {self._animation_frames_written} animation frames."
                 )
 
-    def write(self, image):
+    def write_static_frame(self, image_data):
+        """Write the reference image as a whole or in parts.
+
+        Can be called multiple times with partial image data.
+        """
         if self.fh is None:
             raise RuntimeError("Attempt to write to PngWriter after it has finished.")
-        # TODO: the compressed data must be the concatenation  of all the  idat blocks
-        # if self._idat_compressor is None:
-        #     self._idat_compressor = zlib.compressobj(self._compression, 8, 15, 9)
-        mem = memoryview(image)
-        # todo: check
-        # todo: split in smaller chunks automatically
-        self._idat_written = True
-        self._write_chunk_idat(mem)
+        if self._idat_written == 2:
+            raise RuntimeError("Static image is already written.")
+        self._idat_written = 1
+
+        mem = memoryview(image_data)
+        w, _h, format = _get_im_props_from_memoryview(mem)
+
+        if format != self.format:
+            raise RuntimeError("Image data format does not match the image format.")
+        if w != self.width:
+            raise RuntimeError("Image data width does not match the image width.")
+
+        self._write_frame(self._compressor, mem, "IDAT")
+
+    def _write_frame(self, compressor, mem, chunkname):
+        compressor = self._compressor
+        for i in range(mem.shape[0]):
+            compressor.compress_scanline(mem[i : i + 1])
+            if compressor.pending_nbytes >= self._chunk_limit:
+                self._write_chunk_idat_or_fdat(chunkname, compressor.take_data())
+        if compressor.done:
+            self._write_chunk_idat_or_fdat(chunkname, compressor.take_data())
+            self._idat_written = 2
+        if compressor.too_much:
+            logger.warning("Attempt to write image data beyond image height.")
 
     def write_animation_frame(
         self,
@@ -207,23 +233,31 @@ class PngWriter:
         dispose_op=0,
         blend_op=0,
     ):
+        """Write a single animation frame.
+
+        Must be called once for each frame.
+        """
         if self._png_mode != "apng":
             raise RuntimeError("Not an apng file")
         if self.fh is None:
             raise RuntimeError("Attempt to write to PngWriter after it has finished.")
-        mem = memoryview(image)
+        if self._idat_written == 1:
+            raise RuntimeError("Static image is in progress of being written.")
 
-        width, height = mem.shape[1], mem.shape[0]
+        mem = memoryview(image)
+        w, h, format = _get_im_props_from_memoryview(mem)
+
+        if format != self.format:
+            raise RuntimeError("Frame format does not match the image format.")
+
         x_offset, y_offset = int(x_offset), int(y_offset)
         if (
             x_offset < 0
             or y_offset < 0
-            or x_offset + width > self.width
-            or y_offset + height > self.height
+            or x_offset + w > self.width
+            or y_offset + h > self.height
         ):
-            raise RuntimeError(
-                "Animation frame must be contained within the reference image."
-            )
+            raise RuntimeError("Animation frame must be contained in reference image.")
 
         self._animation_frames_written += 1
 
@@ -242,22 +276,19 @@ class PngWriter:
         # todo: implement sub-rectangle detection
 
         self._write_chunk_fctl(
-            width,
-            height,
-            x_offset,
-            y_offset,
-            delay_num,
-            delay_den,
-            dispose_op,
-            blend_op,
+            w, h, x_offset, y_offset, delay_num, delay_den, dispose_op, blend_op
         )
 
         # First frame can be the static or be independent
         if not self._idat_written:
-            self._idat_written = True
-            self._write_chunk_idat(mem)
+            if w != self.width or h != self.height:
+                raise RuntimeError("First animation frame must be full size.")
+            self.write_static_frame(mem)
         else:
-            self._write_chunk_fdat(mem)
+            compressor = FrameCompressor(self._compression, h)
+            self._write_frame(compressor, mem, "fdAT")
+            if not compressor.done:
+                logger.warning("Not all fdAT data has been written.")
 
     def _write_signature(self):
         self.fh.write(b"\x89PNG\x0d\x0a\x1a\x0a")  # signature
@@ -296,24 +327,10 @@ class PngWriter:
         )
         self._write_chunk("IHDR", data)
 
-    def _write_chunk_idat(self, mem: memoryview):
-        # The image data
-        self._write_chunk("IDAT", self._compress_image_data(mem))
-
-    def _compress_image_data(self, mem):
-        datas = []
-        c = zlib.compressobj(self._compression, 8, 15, 9)
-        for i in range(mem.shape[0]):
-            scanline = mem[i : i + 1]
-            filter_flag = b"\x00"  # no filter
-            bb = c.compress(filter_flag)
-            if bb:
-                datas.append(bb)
-            bb = c.compress(scanline)
-            if bb:
-                datas.append(bb)
-        datas.append(c.flush())
-        return datas
+    def _write_chunk_idat_or_fdat(self, name: str, datas: list):
+        if name == "fdAT":
+            datas.insert(0, struct.pack(">I", next(self._apng_sequence_number)))
+        self._write_chunk(name, datas)
 
     def _write_chunk_iend(self):
         # The image trailer
@@ -328,18 +345,49 @@ class PngWriter:
     def _write_chunk_fctl(self, *args):
         # The frame control chunk
         # width, height, x_offset, y_offset, delay_num, delay_den, dispose_op, blend_op
-        sequence_number = self._apng_sequence_number
-        self._apng_sequence_number += 1
-        data = struct.pack(">IIIIIHHBB", sequence_number, *args)
+        data = struct.pack(">IIIIIHHBB", next(self._apng_sequence_number), *args)
         self._write_chunk("fcTL", data)
 
-    def _write_chunk_fdat(self, mem: memoryview):
-        # The frame data chunk
-        sequence_number = self._apng_sequence_number
-        self._apng_sequence_number += 1
-        datas = self._compress_image_data(mem)
-        datas.insert(0, struct.pack(">I", sequence_number))
-        self._write_chunk("fdAT", datas)
+
+class FrameCompressor:
+    """Go from scanlines to compressed data."""
+
+    def __init__(self, compression, height):
+        self._compressor = zlib.compressobj(compression, 8, 15, 9)
+        self._height = height
+        self._count = 0
+        self.pending_nbytes = 0
+        self.pending_data = []
+        self.done = False
+        self.too_much = False
+
+    def compress_scanline(self, scanline):
+        if self._count >= self._height:
+            self.too_much = True
+            return
+        self._count += 1
+
+        bb = self._compressor.compress(b"\x00")  # filter flag
+        if bb:
+            self.pending_data.append(bb)
+            self.pending_nbytes += len(bb)
+        bb = self._compressor.compress(scanline)
+        if bb:
+            self.pending_data.append(bb)
+            self.pending_nbytes += len(bb)
+
+        if self._count >= self._height:
+            self.done = True
+            bb = self._compressor.flush()
+            if bb:
+                self.pending_data.append(bb)
+                self.pending_nbytes += len(bb)
+
+    def take_data(self):
+        data = self.pending_data
+        self.pending_data = []
+        self.pending_nbytes = 0
+        return data
 
 
 # ----- reading
@@ -533,7 +581,7 @@ class PngReader:
                 pass
             elif name == "IDAT":
                 if self._decompressor is None:
-                    self._decompressor = Decompressor(self._header_info)
+                    self._decompressor = FrameDecompressor(self._header_info)
                     result["scanlines"] = self._decompressor.decompress(data)
                 if next_name != "IDAT":
                     result["scanlines"] += self._decompressor.flush()
@@ -583,7 +631,7 @@ class PngReader:
         return name, data
 
 
-class Decompressor:
+class FrameDecompressor:
     """To go from compressed bytes to scanlines."""
 
     def __init__(self, header_info):
@@ -597,6 +645,11 @@ class Decompressor:
 
     def decompress(self, data):
         decompressed = self._decompressor.decompress(data)
+        # If a writer separately compressed its chunks, don't fail
+        if self._decompressor.eof:
+            tail = self._decompressor.unused_data
+            self._decompressor = zlib.decompressobj(15)
+            decompressed += self._decompressor.decompress(tail)
         return self._process(decompressed)
 
     def flush(self):
