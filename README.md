@@ -5,7 +5,7 @@ Lightweight png reader and writer
 The first P in `ppng` stands for a number of things:
 
 * Pure: the code is pure Python and has zero dependencies.
-* Pretty: a moderately sized single module.
+* Pretty: Two moderately sized modules (one for reading, one for writing).
 * Performant: the heavy lifting is done with Python's builtin zlib module.
   Further it avoids memory copies.
   And the writer does not do fancy filtering that is slow and barely reduces the file size.
