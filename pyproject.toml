@@ -1,0 +1,38 @@
+# ===== Project info
+
+[project]
+dynamic = ["version"]
+name = "ppng"
+description = "Pretty powerful pure Python png reader and writer"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Almar Klein" }]
+keywords = ["png", "apng"]
+requires-python = ">= 3.9"
+dependencies = []                                                 # look, no deps!
+[project.optional-dependencies]
+lint = ["ruff"]
+docs = ["sphinx>7.2", "sphinx_rtd_theme"]
+tests = ["pytest", "numpy", "imageio"]
+dev = ["rendercanvas[lint,docs,tests]"]
+
+[project.urls]
+Homepage = "https://github.com/almarklein/ppng"
+Documentation = "https://github.com/almarklein/ppng"
+Repository = "https://github.com/almarklein/ppng"
+
+# ===== Building
+
+# Flit is great solution for simple pure-Python projects.
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+# ===== Tooling
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "N", "B", "RUF"]
+ignore = []
