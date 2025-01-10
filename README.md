@@ -13,6 +13,11 @@ The first P in `ppng` stands for a number of things:
 * Partial: does not support the full png spec (see below).
 
 
+## Status
+
+Work in progress.
+
+
 ## PNG is pretty cool
 
 PNG is a widespread format to store lossless images. It offers good compression, pretty nice

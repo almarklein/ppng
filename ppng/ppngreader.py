@@ -1,7 +1,7 @@
 # Copyright (c) 2016-2025, Almar Klein
 # This module is distributed under the terms of the MIT License.
 """
-Pure python module to handle for reading png images.
+Pure python module for reading png images.
 """
 
 __all__ = ["PngReader", "read_png"]
@@ -207,7 +207,7 @@ class PngReader:
             elif name == "IDAT":
                 if self._decompressor is None:
                     self._decompressor = FrameDecompressor(self._header_info)
-                    result["scanlines"] = self._decompressor.decompress(data)
+                result["scanlines"] = self._decompressor.decompress(data)
                 if next_name != "IDAT":
                     result["scanlines"] += self._decompressor.flush()
                     if not self._decompressor.done:
@@ -318,6 +318,9 @@ def unfilter_scanline(line_bytes, fu=4, prev=None):
     if filter == 0:
         return line1  # no filter
     line2 = bytearray(line1)  # copy for output
+
+    if filter in (2, 3, 4) and prev is None:
+        prev = bytearray(len(line1))  # zeros
 
     if filter == 1:
         # sub

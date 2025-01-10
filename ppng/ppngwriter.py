@@ -5,10 +5,10 @@
 # Or you can make ppng a (light) dependency.
 
 """
-Pure python module to handle for writing png images.
+Pure python module for writing png images.
 
 Supports:
-- Greyscale, greyscale-plus-alpha, RGB, RGBA.
+- Grayscale, grayscale+alpha, RGB, RGBA.
 - 8 bit and 16 bit.
 - Chunked writing.
 - Animated images.
@@ -36,6 +36,8 @@ version_info = tuple(int(i) if i.isnumeric() else i for i in __version__.split("
 
 
 logger = logging.getLogger("ppng")
+
+# todo: when to warn, when to error?
 
 COLOR_TYPES = {
     # flag, pixel-size, format, bitdepths
@@ -167,14 +169,15 @@ class PngWriter:
         return self
 
     def __exit__(self, value, type, tb):
-        # todo: check that all is written
         self._write_chunk_iend()
         if self.fh is not self.file:
             self.fh.close()
         self.fh = None
 
         # Sanity checks
-        if not self._compressor.done:
+        if self._idat_written == 0:
+            logger.warning("IDAT data has not been written.")
+        elif self._idat_written == 1:
             logger.warning("Not all IDAT data has been written.")
         if self._png_mode == "apng":
             if self._animation_frames_written != self._frame_count:
