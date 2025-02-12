@@ -30,6 +30,11 @@ import logging
 import itertools
 from typing import Union
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 
 __version__ = "1.0.0"
 version_info = tuple(int(i) if i.isnumeric() else i for i in __version__.split("."))
@@ -65,7 +70,7 @@ def get_im_props_from_memoryview(mem):
     return width, height, format
 
 
-def write_png(file, image, *, compression=9):
+def write_png(file, image, *, compression=9, filter=0):
     """Write an image to a png file.
 
     Parameters:
@@ -81,7 +86,9 @@ def write_png(file, image, *, compression=9):
     """
     mem = memoryview(image)
     width, height, format = get_im_props_from_memoryview(mem)
-    with PngWriter(file, width, height, format, compression=compression) as writer:
+    with PngWriter(
+        file, width, height, format, compression=compression, filter=filter
+    ) as writer:
         writer.write_static_frame(mem)
 
 
@@ -131,6 +138,7 @@ class PngWriter:
         png_mode="png",
         frame_count=1,
         compression=9,
+        filter=0,
         chunk_limmit=2**20,
     ):
         # Get file handle
@@ -150,6 +158,7 @@ class PngWriter:
 
         # Configuration
         self._compression = int(compression)
+        self._filter = int(filter)
         self._png_mode = str(png_mode)
         self._frame_count = int(frame_count)  # for apng
         self._chunk_limit = int(chunk_limmit)
@@ -158,7 +167,7 @@ class PngWriter:
         self._animation_frames_written = 0
         self._apng_sequence_number = itertools.count()
         self._idat_written = 0  # 0 no, 1 wip, 2 done
-        self._compressor = FrameCompressor(self._compression, self.height)
+        self._compressor = FrameCompressor(self._compression, self._filter, self.height)
 
     def __enter__(self):
         # Write signature and header chunk
@@ -281,7 +290,7 @@ class PngWriter:
                 raise RuntimeError("First animation frame must be full size.")
             self.write_static_frame(mem)
         else:
-            compressor = FrameCompressor(self._compression, h)
+            compressor = FrameCompressor(self._compression, self._filter, h)
             self._write_frame(compressor, mem, "fdAT")
             if not compressor.done:
                 logger.warning("Not all fdAT data has been written.")
@@ -348,10 +357,12 @@ class PngWriter:
 class FrameCompressor:
     """Convert scanlines to compressed data."""
 
-    def __init__(self, compression, height):
+    def __init__(self, compression, filter, height):
         self._compressor = zlib.compressobj(compression, 8, 15, 9)
+        self._filter = filter
         self._height = height
         self._count = 0
+        self._last_scanline = None
         self.pending_nbytes = 0
         self.pending_data = []
         self.done = False
@@ -363,11 +374,64 @@ class FrameCompressor:
             return
         self._count += 1
 
-        bb = self._compressor.compress(b"\x00")  # filter flag
+        # Note: filters operate on bytes, but the neighbouring bytes mean the
+        # corresponding bytes in the neighbouring pixel.
+        scanline = np.asarray(scanline)
+        scanline.shape = scanline.shape[1], -1
+        assert scanline.dtype == np.uint8
+
+        # Default to no filter
+        filter_byte = b"\x00"
+        filtered_scanline = scanline
+
+        if np and self._filter:
+            # Use numpy for filtering
+            filter = self._filter
+            if self._last_scanline is None and filter >= 2:
+                self._last_scanline = np.zeros_like(scanline)
+            if filter == 1:
+                # Sub
+                filter_byte = b"\x01"
+                filtered_scanline = scanline.copy()
+                filtered_scanline[1:] -= scanline[:-1]
+            elif filter == 2:
+                # Up
+                filter_byte = b"\x02"
+                filtered_scanline = scanline - self._last_scanline
+            elif filter == 3:
+                # Average
+                filter_byte = b"\x03"
+                filtered_scanline = scanline.copy()
+                scanline = scanline.astype(np.uint16)
+                self._last_scanline = self._last_scanline.astype(
+                    np.uint16
+                )  # todo: inefficient
+                filtered_scanline[1:] -= (scanline[:-1] + self._last_scanline[1:]) >> 1
+                filtered_scanline[0] -= self._last_scanline[0] >> 1
+            elif filter == 4:
+                # Paeth
+                filter_byte = b"\x04"
+                filtered_scanline = scanline.copy()
+                scanline = scanline.astype(np.int16)
+                self._last_scanline = self._last_scanline.astype(
+                    np.int16
+                )  # todo: inefficient
+                a = scanline[:-1]
+                b = self._last_scanline[1:]
+                c = self._last_scanline[:-1]
+                filtered_scanline[1:] -= paeth(a, b, c).astype(np.uint8)
+                zero = np.zeros_like(self._last_scanline[0])
+                filtered_scanline[0] -= paeth(
+                    zero, self._last_scanline[0], zero
+                ).astype(np.uint8)
+            self._last_scanline = scanline
+
+        bb = self._compressor.compress(filter_byte)
         if bb:
             self.pending_data.append(bb)
             self.pending_nbytes += len(bb)
-        bb = self._compressor.compress(scanline)
+
+        bb = self._compressor.compress(filtered_scanline)
         if bb:
             self.pending_data.append(bb)
             self.pending_nbytes += len(bb)
@@ -384,3 +448,15 @@ class FrameCompressor:
         self.pending_data = []
         self.pending_nbytes = 0
         return data
+
+
+def paeth(a, b, c):
+    # Paeth predictor algorithm, for numpy arrays
+    p = a + b - c
+    pa = np.abs(p - a)
+    pb = np.abs(p - b)
+    pc = np.abs(p - c)
+    isa = (pa <= pb) & (pa <= pc)
+    isb = (~isa) & (pb <= pc)
+    isc = (~isa) & (~isb)
+    return isa * a + isb * b + isc * c

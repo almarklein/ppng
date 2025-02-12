@@ -13,6 +13,11 @@ import pathlib
 
 from .ppngwriter import logger, FORMAT_TO_PSIZE, COLOR_FLAG_TO_FORMAT
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 
 SINGLETON_CHUNKS = """ IHDR IEND PLTE acTL cHRM cICP gAMA iCCP mDCv cLLi sBIT sRGB
                        bKGD hIST tRNS eXIf pHYs tIME""".split()
@@ -288,12 +293,15 @@ class FrameDecompressor:
         decompressed = memoryview(decompressed)
         # Convert data to scanlines
         psize = FORMAT_TO_PSIZE[self._info["format"]]
-        stride = self._info["width"] * psize
+        width = self._info["width"]
+        stride = width * psize
         stride = stride * self._info["bit_depth"] // 8 + 1
         scanlines = []
         while len(decompressed) >= stride and self._scanline_count < self._height:
             raw_scanline, decompressed = decompressed[:stride], decompressed[stride:]
-            scanline = unfilter_scanline(raw_scanline, psize, self._last_scanline)
+            scanline = unfilter_scanline(
+                raw_scanline, psize, width, self._last_scanline
+            )
             scanlines.append(scanline)
             self._last_scanline = scanline
             self._scanline_count += 1
@@ -305,7 +313,7 @@ class FrameDecompressor:
         return scanlines
 
 
-def unfilter_scanline(line_bytes, fu=4, prev=None):
+def unfilter_scanline(line_bytes, fu, width, prev=None):
     """Scanline unfiltering, inspired by pypng"""
     # From what I found, the filtering is relatively costly while barely adding
     # a compression benefit. This is why we don't use it in the writer.
@@ -317,10 +325,26 @@ def unfilter_scanline(line_bytes, fu=4, prev=None):
     # todo: cast to 16 bit if bithdepth is so
     if filter == 0:
         return line1  # no filter
-    line2 = bytearray(line1)  # copy for output
 
     if filter in (2, 3, 4) and prev is None:
         prev = bytearray(len(line1))  # zeros
+
+    if np and filter in (1, 2):
+        # Use Numpy
+        line1 = np.asarray(line1)
+        line1.shape = width, -1
+        assert line1.dtype == np.uint8
+        if filter == 1:
+            line2 = np.cumsum(line1, axis=0, dtype=np.uint8)
+        elif filter == 2:
+            prev = np.asarray(prev)
+            prev.shape = width, -1
+            line2 = prev + line1
+        else:
+            raise NotImplementedError(f"Filter {filter}")
+        return memoryview(line2.reshape(-1))
+
+    line2 = bytearray(line1)  # copy for output
 
     if filter == 1:
         # sub
