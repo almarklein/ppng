@@ -426,7 +426,7 @@ testcases = [
 for case in testcases:
     case.measure()
 
-fig = plt.figure(3)
+fig = plt.figure(4)
 fig.clear()
 fig.set_size_inches(12, len(testcases) * 3)
 
